@@ -1,5 +1,6 @@
 /* SmoothStudy PDF export. No dependencies.
-   Writes a real vector-text PDF (Helvetica + Courier, WinAnsi) and embeds diagrams as JPEG images.
+   Writes a real vector-text PDF: Google Sans (embedded TrueType, loaded from /fonts) for the notes, Courier for monospace,
+   with Helvetica as the fallback if the Google Sans files are missing. Diagrams are embedded as JPEG images.
    Exposes window.SmoothPDF.build(model) -> Uint8Array, or null when the text contains characters the
    built-in PDF fonts cannot show (the caller then falls back to the browser's print dialog). */
 (function () {
@@ -90,10 +91,123 @@
     }
     return w;
   }
-  // exact = true for placing text; otherwise a 1.5% safety margin is added for line-fitting decisions
+  // exact = true for placing text; otherwise a small safety margin is added for line-fitting decisions
+  let curGS = null; // the Google Sans fonts for the current build, or null to use Helvetica
   function measure(text, font, size, exact) {
     if (font === 'M' || font === 'MB') return text.length * 0.6 * size;
+    const g = curGS && (font === 'B' ? curGS.B : curGS.R);
+    if (g) return g.width(text) * size * (exact ? 1 : 1.004);
     return unitWidth(text, font === 'B') * size * (exact ? 1 : 1.015);
+  }
+
+  /* ------------------------------------------------------------------ Google Sans (TrueType) */
+  const GS_FILES = { R: '/fonts/GoogleSans-Regular.ttf', B: '/fonts/GoogleSans-Bold.ttf' };
+  let gsPromise = null;
+
+  // Reads what a PDF needs from a TrueType file: metrics, the character map and the raw bytes to embed.
+  function parseTTF(u8) {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const tag = (o) => String.fromCharCode(dv.getUint8(o), dv.getUint8(o + 1), dv.getUint8(o + 2), dv.getUint8(o + 3));
+    if (u8.length < 12 || (dv.getUint32(0) !== 0x00010000 && tag(0) !== 'true')) return null; // CFF (OTTO) fonts cannot be embedded this way
+    const T = {};
+    for (let i = 0, n = dv.getUint16(4); i < n; i++) { const o = 12 + i * 16; T[tag(o)] = dv.getUint32(o + 8); }
+    for (const need of ['head', 'hhea', 'hmtx', 'maxp', 'cmap', 'glyf']) if (T[need] === undefined) return null;
+    const upem = dv.getUint16(T.head + 18);
+    const bbox = [dv.getInt16(T.head + 36), dv.getInt16(T.head + 38), dv.getInt16(T.head + 40), dv.getInt16(T.head + 42)];
+    const asc = dv.getInt16(T.hhea + 4), desc = dv.getInt16(T.hhea + 6), nh = dv.getUint16(T.hhea + 34);
+    const adv = (g) => dv.getUint16(T.hmtx + 4 * Math.min(g, nh - 1));
+    // pick a Unicode character map: format 12 (full) first, then format 4 (basic)
+    let sub = -1, rank = 99;
+    for (let i = 0, n = dv.getUint16(T.cmap + 2); i < n; i++) {
+      const pid = dv.getUint16(T.cmap + 4 + i * 8), eid = dv.getUint16(T.cmap + 6 + i * 8), off = T.cmap + dv.getUint32(T.cmap + 8 + i * 8);
+      const fmt = dv.getUint16(off);
+      const r = pid === 3 && eid === 10 && fmt === 12 ? 0 : pid === 0 && fmt === 12 ? 1 : pid === 3 && eid === 1 && fmt === 4 ? 2 : pid === 0 && fmt === 4 ? 3 : 99;
+      if (r < rank) { rank = r; sub = off; }
+    }
+    if (sub < 0) return null;
+    const fmt = dv.getUint16(sub);
+    const cache = new Map();
+    const look = (c) => {
+      if (fmt === 12) {
+        for (let i = 0, n = dv.getUint32(sub + 12); i < n; i++) {
+          const o = sub + 16 + i * 12, s = dv.getUint32(o), e = dv.getUint32(o + 4);
+          if (c >= s && c <= e) return dv.getUint32(o + 8) + (c - s);
+        }
+        return 0;
+      }
+      if (c > 0xFFFF) return 0;
+      const segX2 = dv.getUint16(sub + 6), ends = sub + 14, starts = ends + segX2 + 2, deltas = starts + segX2, ranges = deltas + segX2;
+      for (let i = 0; i < segX2 / 2; i++) {
+        if (c > dv.getUint16(ends + i * 2)) continue;
+        const s = dv.getUint16(starts + i * 2);
+        if (c < s) return 0;
+        const ro = dv.getUint16(ranges + i * 2), d = dv.getInt16(deltas + i * 2);
+        if (ro === 0) return (c + d) & 0xFFFF;
+        const g = dv.getUint16(ranges + i * 2 + ro + (c - s) * 2);
+        return g ? (g + d) & 0xFFFF : 0;
+      }
+      return 0;
+    };
+    const gid = (c) => { let g = cache.get(c); if (g === undefined) { g = look(c); cache.set(c, g); } return g; };
+    const font = {
+      bytes: u8, upem, bbox, asc, desc, adv, gid, used: new Map(),
+      width(text) { let w = 0; for (const ch of text) w += adv(gid(ch.codePointAt(0))); return w / upem; },
+      encode(text) { // PDF hex string of glyph numbers
+        let h = '<';
+        for (const ch of text) { const cp = ch.codePointAt(0), g = gid(cp); font.used.set(g, cp); h += g.toString(16).padStart(4, '0'); }
+        return h + '>';
+      },
+    };
+    return font;
+  }
+
+  // Loads both Google Sans files once. Resolves null if either is missing, and the PDF then uses Helvetica.
+  function loadGS() {
+    if (!gsPromise) {
+      gsPromise = (async () => {
+        try {
+          const r = {};
+          for (const k of ['R', 'B']) {
+            const res = await fetch(GS_FILES[k]);
+            if (!res.ok) return null;
+            const f = parseTTF(new Uint8Array(await res.arrayBuffer()));
+            if (!f) return null;
+            r[k] = f;
+          }
+          return r;
+        } catch (e) { return null; }
+      })();
+    }
+    return gsPromise;
+  }
+
+  const binStr = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return s; };
+  async function deflate(u8) {
+    if (typeof CompressionStream === 'undefined') return null;
+    try {
+      const cs = new CompressionStream('deflate'), w = cs.writable.getWriter();
+      w.write(u8); w.close();
+      return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+    } catch (e) { return null; }
+  }
+
+  // Adds the PDF objects for one embedded font; returns the object number of the font to reference from pages.
+  async function addType0(g, psName, add) {
+    const comp = await deflate(g.bytes);
+    const data = binStr(comp || g.bytes), sc = 1000 / g.upem;
+    const ff = add(`<< /Length ${data.length} /Length1 ${g.bytes.length}${comp ? ' /Filter /FlateDecode' : ''} >>\nstream\n${data}\nendstream`);
+    const fd = add(`<< /Type /FontDescriptor /FontName /${psName} /Flags 32 /FontBBox [${g.bbox.map((v) => Math.round(v * sc)).join(' ')}] /ItalicAngle 0 /Ascent ${Math.round(g.asc * sc)} /Descent ${Math.round(g.desc * sc)} /CapHeight ${Math.round(g.asc * sc * 0.7)} /StemV 80 /FontFile2 ${ff} 0 R >>`);
+    const gids = [...g.used.keys()].sort((a, b) => a - b);
+    const W = gids.map((id) => `${id} [${Math.round(g.adv(id) * sc)}]`).join(' ');
+    const cid = add(`<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${psName} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor ${fd} 0 R /CIDToGIDMap /Identity /DW 1000 /W [ ${W} ] >>`);
+    const hex4 = (n) => n.toString(16).toUpperCase().padStart(4, '0');
+    const u16 = (cp) => { if (cp > 0xFFFF) { cp -= 0x10000; return hex4(0xD800 + (cp >> 10)) + hex4(0xDC00 + (cp & 1023)); } return hex4(cp); };
+    const entries = gids.filter((id) => id > 0).map((id) => `<${hex4(id)}> <${u16(g.used.get(id))}>`);
+    let blocks = '';
+    for (let i = 0; i < entries.length; i += 100) { const part = entries.slice(i, i + 100); blocks += `${part.length} beginbfchar\n${part.join('\n')}\nendbfchar\n`; }
+    const cmap = `/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n${blocks}endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend`;
+    const tu = add(`<< /Length ${cmap.length} >>\nstream\n${cmap}\nendstream`);
+    return add(`<< /Type /Font /Subtype /Type0 /BaseFont /${psName} /Encoding /Identity-H /DescendantFonts [ ${cid} 0 R ] /ToUnicode ${tu} 0 R >>`);
   }
 
   /* ------------------------------------------------------------------ colours */
@@ -109,7 +223,9 @@
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   /* ------------------------------------------------------------------ build */
-  function build(model) {
+  async function build(model) {
+    curGS = await loadGS();
+    if (curGS) { curGS.R.used = new Map(); curGS.B.used = new Map(); }
     const state = { bad: false };
     const s = model.summary || {};
     const accent = model.dark ? ACCENTS.dark : ACCENTS.light;
@@ -143,8 +259,10 @@
         `${f(cx - r)} ${f(PAGE.h - cy - k)} ${f(cx - k)} ${f(PAGE.h - cy - r)} ${X} ${f(PAGE.h - cy - r)} c ` +
         `${f(cx + k)} ${f(PAGE.h - cy - r)} ${f(cx + r)} ${f(PAGE.h - cy - k)} ${f(cx + r)} ${T} c f`);
     };
-    const text = (str, font, size, x, baseTop, c) =>
-      page.ops.push(`BT /${FONT[font][0]} ${size} Tf ${rgb(c)} rg 1 0 0 1 ${f(x)} ${Y(baseTop)} Tm ${pdfStr(str)} Tj ET`);
+    const text = (str, font, size, x, baseTop, c) => {
+      const g = curGS && (font === 'R' ? curGS.R : font === 'B' ? curGS.B : null);
+      page.ops.push(`BT /${FONT[font][0]} ${size} Tf ${rgb(c)} rg 1 0 0 1 ${f(x)} ${Y(baseTop)} Tm ${g ? g.encode(str) : pdfStr(str)} Tj ET`);
+    };
 
     // **bold** and `code` inside a string -> styled runs
     const parseInline = (str, baseFont, color) => {
@@ -324,7 +442,11 @@
     const add = (body) => { objs.push(body); return objs.length; };
     add(null); // 1 catalog
     add(null); // 2 pages
-    const fontIds = ['R', 'B', 'M', 'MB'].map((k) => add(`<< /Type /Font /Subtype /Type1 /BaseFont /${FONT[k][1]} /Encoding /WinAnsiEncoding >>`));
+    const fontIds = [];
+    for (const k of ['R', 'B', 'M', 'MB']) {
+      if (curGS && (k === 'R' || k === 'B')) fontIds.push(await addType0(curGS[k], k === 'R' ? 'GoogleSans-Regular' : 'GoogleSans-Bold', add));
+      else fontIds.push(add(`<< /Type /Font /Subtype /Type1 /BaseFont /${FONT[k][1]} /Encoding /WinAnsiEncoding >>`));
+    }
     const pad = (n) => String(n).padStart(2, '0');
     const info = add(`<< /Title ${pdfStr(title.replace(/\?/g, ''))} /Producer (SmoothStudy) /Creator (SmoothStudy) /CreationDate (D:${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}) >>`);
     const imgIds = images.map((im) => add(`<< /Type /XObject /Subtype /Image /Width ${im.pw} /Height ${im.ph} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${im.data.length} >>\nstream\n${im.data}\nendstream`));
