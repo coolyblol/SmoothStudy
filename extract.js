@@ -205,9 +205,170 @@ function fromRtf(buf) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
+
+// ---- PDF text (best effort, no dependencies). Handles Flate streams, object streams and ToUnicode maps.
+function pdfObjects(buf) {
+  const latin = buf.toString('latin1');
+  const objs = {};
+  const inflate = (b) => { try { return zlib.inflateSync(b); } catch (_) { try { return zlib.inflateRawSync(b); } catch (_) { return null; } } };
+  const re = /(\d+)\s+(\d+)\s+obj\b/g;
+  let m;
+  while ((m = re.exec(latin))) {
+    const start = re.lastIndex;
+    const sIdx = latin.indexOf('stream', start);
+    const eIdx = latin.indexOf('endobj', start);
+    if (eIdx < 0) break;
+    let dict, data = null;
+    if (sIdx >= 0 && sIdx < eIdx) {
+      dict = latin.slice(start, sIdx);
+      let b = sIdx + 6;
+      if (latin[b] === '\r') b++;
+      if (latin[b] === '\n') b++;
+      let e = latin.indexOf('endstream', b);
+      if (e < 0) e = eIdx;
+      let raw = buf.subarray(b, e);
+      if (/\/FlateDecode/.test(dict)) raw = inflate(raw);
+      else if (/\/Filter/.test(dict)) raw = null;
+      data = raw;
+      re.lastIndex = Math.max(re.lastIndex, e);
+    } else dict = latin.slice(start, eIdx);
+    objs[m[1]] = { dict, data };
+  }
+  // compressed object streams
+  for (const k of Object.keys(objs)) {
+    const o = objs[k];
+    if (!/\/Type\s*\/ObjStm/.test(o.dict) || !o.data) continue;
+    const n = +((o.dict.match(/\/N\s+(\d+)/) || [])[1] || 0), first = +((o.dict.match(/\/First\s+(\d+)/) || [])[1] || 0);
+    const txt = o.data.toString('latin1');
+    const nums = txt.slice(0, first).trim().split(/\s+/).map(Number);
+    for (let i = 0; i < n; i++) {
+      const id = nums[i * 2], off = nums[i * 2 + 1];
+      const next = i + 1 < n ? nums[(i + 1) * 2 + 1] : txt.length - first;
+      if (!(id in objs)) objs[id] = { dict: txt.slice(first + off, first + next), data: null };
+    }
+  }
+  return objs;
+}
+
+function parseCMap(text) {
+  const map = {};
+  const u16 = (h) => { let s = ''; for (let i = 0; i + 3 < h.length + 0; i += 4) s += String.fromCharCode(parseInt(h.substr(i, 4), 16)); if (h.length === 2) s = String.fromCharCode(parseInt(h, 16)); return s; };
+  for (const blk of text.match(/beginbfchar[\s\S]*?endbfchar/g) || []) {
+    for (const x of blk.matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g)) map[parseInt(x[1], 16)] = u16(x[2]);
+  }
+  for (const blk of text.match(/beginbfrange[\s\S]*?endbfrange/g) || []) {
+    for (const x of blk.matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(<[0-9a-fA-F]+>|\[[^\]]*\])/g)) {
+      const lo = parseInt(x[1], 16), hi = Math.min(parseInt(x[2], 16), lo + 65535);
+      if (x[3][0] === '[') { const arr = [...x[3].matchAll(/<([0-9a-fA-F]+)>/g)].map((a) => u16(a[1])); for (let c = lo; c <= hi && c - lo < arr.length; c++) map[c] = arr[c - lo]; }
+      else { const base = x[3].slice(1, -1); const start = parseInt(base, 16); const len = base.length; for (let c = lo; c <= hi; c++) map[c] = u16((start + c - lo).toString(16).padStart(len, '0')); }
+    }
+  }
+  return map;
+}
+
+function fromPdf(buf) {
+  const objs = pdfObjects(buf);
+  const cmapOf = {};
+  const fontMap = (num) => {
+    if (num in cmapOf) return cmapOf[num];
+    const o = objs[num]; let map = null;
+    if (o) {
+      const tu = (o.dict.match(/\/ToUnicode\s+(\d+)\s+\d+\s+R/) || [])[1];
+      if (tu && objs[tu] && objs[tu].data) map = parseCMap(objs[tu].data.toString('latin1'));
+    }
+    return (cmapOf[num] = map);
+  };
+  const resolveDict = (d) => { const r = d.match(/^\s*(\d+)\s+\d+\s+R\s*$/); return r && objs[r[1]] ? objs[r[1]].dict : d; };
+  const grabDict = (src, key) => { // returns the text of << ... >> after /Key, or an indirect object's dict
+    const i = src.search(new RegExp('/' + key + '\\b'));
+    if (i < 0) return null;
+    let rest = src.slice(i + key.length + 1).trimStart();
+    const ref = rest.match(/^(\d+)\s+\d+\s+R/);
+    if (ref) return objs[ref[1]] ? objs[ref[1]].dict : null;
+    if (rest.startsWith('<<')) { let depth = 0, j = 0; for (; j < rest.length; j++) { if (rest.startsWith('<<', j)) { depth++; j++; } else if (rest.startsWith('>>', j)) { depth--; j++; if (!depth) break; } } return rest.slice(0, j + 1); }
+    return null;
+  };
+  const pageFonts = (dict, seen = 0) => {
+    const res = grabDict(dict, 'Resources');
+    const fonts = {};
+    if (res) {
+      const fd = grabDict(res, 'Font');
+      if (fd) for (const x of fd.matchAll(/\/([^\s\/<>\[\]()]+)\s+(\d+)\s+\d+\s+R/g)) fonts[x[1]] = x[2];
+    } else if (seen < 6) {
+      const par = (dict.match(/\/Parent\s+(\d+)\s+\d+\s+R/) || [])[1];
+      if (par && objs[par]) return pageFonts(objs[par].dict, seen + 1);
+    }
+    return fonts;
+  };
+  const pages = [];
+  const contentFont = {}; // content stream object -> font resource map
+  const order = [];
+  for (const k of Object.keys(objs).map(Number).sort((a, b) => a - b)) {
+    const d = objs[k].dict;
+    if (!/\/Type\s*\/Page\b(?!s)/.test(d)) continue;
+    const fonts = pageFonts(d);
+    const c = d.match(/\/Contents\s*(\[[^\]]*\]|\d+\s+\d+\s+R)/);
+    if (!c) continue;
+    const refs = [...c[1].matchAll(/(\d+)\s+\d+\s+R/g)].map((x) => x[1]);
+    pages.push({ refs, fonts });
+  }
+  const unesc = (s) => s.replace(/\\([nrtbf()\\]|[0-7]{1,3}|\r?\n)/g, (m, e) => {
+    if (e === 'n') return '\n'; if (e === 'r') return '\r'; if (e === 't') return '\t'; if (e === 'b' || e === 'f') return '';
+    if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8) & 255);
+    if (e[0] === '\r' || e[0] === '\n') return '';
+    return e;
+  });
+  const out = [];
+  for (const pg of pages) {
+    let text = '';
+    for (const ref of pg.refs) {
+      const o = objs[ref];
+      if (!o || !o.data) continue;
+      const s = o.data.toString('latin1');
+      let cmap = null;
+      const tokens = /BT|ET|\/([^\s\/<>\[\]()]+)\s+[-\d.]+\s+Tf|\[((?:[^\]\\]|\\.)*)\]\s*TJ|\(((?:[^()\\]|\\.|\((?:[^()\\]|\\.)*\))*)\)\s*(?:Tj|'|")|<([0-9a-fA-F\s]+)>\s*Tj|T\*|(-?[\d.]+)\s+(-?[\d.]+)\s+T[dD]/g;
+      const dec = (hexOrLit, isHex) => {
+        if (isHex) {
+          const h = hexOrLit.replace(/\s+/g, '');
+          let r = '';
+          if (cmap) {
+            const step = Object.keys(cmap).some((c) => +c > 255) || h.length % 4 === 0 ? 4 : 2;
+            for (let i = 0; i + step <= h.length; i += step) { const ch = cmap[parseInt(h.substr(i, step), 16)]; if (ch !== undefined) r += ch; }
+          } else for (let i = 0; i + 2 <= h.length; i += 2) r += String.fromCharCode(parseInt(h.substr(i, 2), 16));
+          return r;
+        }
+        const raw = unesc(hexOrLit);
+        if (cmap) { let r = ''; for (const ch of raw) { const v = cmap[ch.charCodeAt(0)]; r += v !== undefined ? v : ch; } return r; }
+        return raw;
+      };
+      let m;
+      while ((m = tokens.exec(s))) {
+        const t = m[0];
+        if (m[1] !== undefined) { const fnum = pg.fonts[m[1]]; cmap = fnum ? fontMap(fnum) : null; }
+        else if (m[2] !== undefined) {
+          for (const x of m[2].matchAll(/\(((?:[^()\\]|\\.)*)\)|<([0-9a-fA-F\s]+)>|(-?[\d.]+)/g)) {
+            if (x[1] !== undefined) text += dec(x[1], false);
+            else if (x[2] !== undefined) text += dec(x[2], true);
+            else if (x[3] !== undefined && parseFloat(x[3]) < -200) text += ' ';
+          }
+        } else if (m[3] !== undefined) text += dec(m[3], false);
+        else if (m[4] !== undefined) text += dec(m[4], true);
+        else if (t === 'ET' || t === 'T*') text += '\n';
+        else if (m[6] !== undefined && Math.abs(parseFloat(m[6])) > 2) text += '\n';
+      }
+    }
+    text = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (text) out.push(text);
+  }
+  const joined = out.map((t, i) => `--- Page ${i + 1} ---\n${t}`).join('\n\n');
+  if (joined.replace(/--- Page \d+ ---|\s/g, '').length < 40) throw new Error('has no text the server can read (it may be a scan, or use an unusual encoding). Paste the text instead, or export it as a .docx.');
+  return joined;
+}
+
 // kind is one of the text-based kinds from kindOf(). Returns plain text.
 function extractText(kind, buf) {
   switch (kind) {
+    case 'pdf': return fromPdf(buf);
     case 'docx': return fromDocx(buf);
     case 'pptx': return fromPptx(buf);
     case 'xlsx': return fromXlsx(buf);
