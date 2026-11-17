@@ -34,7 +34,7 @@
       startOnLoad: false,
       theme: 'base',
       securityLevel: 'strict',
-      fontFamily: 'Lexend, sans-serif',
+      fontFamily: "'Google Sans', Lexend, sans-serif",
       themeVariables: dark
         ? { background: '#151e29', primaryColor: '#1d2a3a', primaryTextColor: '#eef0ec', primaryBorderColor: '#8fb8de', lineColor: '#c4d8e6', secondaryColor: '#243142', tertiaryColor: '#151e29' }
         : { background: '#ffffff', primaryColor: '#fbe6dc', primaryTextColor: '#2b211d', primaryBorderColor: '#c8553d', lineColor: '#e07a5a', secondaryColor: '#fdf0e9', tertiaryColor: '#ffffff' },
@@ -340,7 +340,7 @@
     btn.classList.add('busy');
     try {
       const dark = document.documentElement.getAttribute('data-theme') === 'dark';
-      const bytes = window.SmoothPDF ? window.SmoothPDF.build({ summary, images: await diagramImages(dark), dark }) : null;
+      const bytes = window.SmoothPDF ? await window.SmoothPDF.build({ summary, images: await diagramImages(dark), dark }) : null;
       if (bytes) {
         const name = String(summary.title || 'SmoothStudy notes').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'SmoothStudy notes';
         saveBlob(bytes, name + '.pdf');
@@ -398,6 +398,18 @@
     window.addEventListener('keydown', (e) => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(e.key)) interrupt(); });
     if (window.ResizeObserver) new ResizeObserver(update).observe(document.body); // page grows when the summary appears
     update();
+  })();
+
+  /* ---------------- Start button: after a one-second hover it wiggles, and keeps wiggling while hovered ---------------- */
+  (function () {
+    const b = document.querySelector('.btn-start');
+    if (!b) return;
+    const DELAY = 1000; // hover time before the wiggle begins
+    let wait = null;
+    const stop = () => { clearTimeout(wait); b.classList.remove('wiggle'); };
+    b.addEventListener('mouseenter', () => { stop(); wait = setTimeout(() => b.classList.add('wiggle'), DELAY); });
+    b.addEventListener('mouseleave', stop);
+    b.addEventListener('click', stop);
   })();
 
   setTheme(getPref(), false);
