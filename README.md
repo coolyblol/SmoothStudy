@@ -6,7 +6,7 @@ Upload notes (PDF, Word, PowerPoint and more) or type them, get a condensed summ
 
 Requires Node 18 or newer. There is nothing to install.
 
-1. Copy `.env.example` to `.env` and paste your Groq API key after `GROQ_API_KEY=` (it starts with `gsk_`). Only a Groq key works, and the variable must be named `GROQ_API_KEY`. If your `.env` still says `ANTHROPIC_API_KEY=`, rename that to `GROQ_API_KEY=` and keep the same value.
+1. Open `.env` and paste your Groq API key after `GROQ_API_KEY=` (it starts with `gsk_`).
 2. Run `node download-fonts.js` once. It needs internet and saves every font into `fonts/` (see "Fonts" below).
 3. Run `node server.js`
 4. Open http://localhost:3000
