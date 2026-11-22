@@ -34,7 +34,7 @@
       startOnLoad: false,
       theme: 'base',
       securityLevel: 'strict',
-      fontFamily: "'Google Sans', Lexend, sans-serif",
+      fontFamily: "'Google Sans', 'Outfit', sans-serif",
       themeVariables: dark
         ? { background: '#151e29', primaryColor: '#1d2a3a', primaryTextColor: '#eef0ec', primaryBorderColor: '#8fb8de', lineColor: '#c4d8e6', secondaryColor: '#243142', tertiaryColor: '#151e29' }
         : { background: '#ffffff', primaryColor: '#fbe6dc', primaryTextColor: '#2b211d', primaryBorderColor: '#c8553d', lineColor: '#e07a5a', secondaryColor: '#fdf0e9', tertiaryColor: '#ffffff' },
@@ -53,6 +53,37 @@
       r.onerror = () => rej(new Error('Could not read ' + file.name));
       r.readAsDataURL(file);
     });
+  }
+  // Pictures are shrunk before upload (max 2000 px, JPEG) so they are fast to send and fit the AI's size limit.
+  async function prepareFile(f) {
+    const ext = (f.name.split('.').pop() || '').toLowerCase();
+    if (!['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return { name: f.name, data: await toBase64(f) };
+    try {
+      const bmp = await createImageBitmap(f);
+      const big = Math.max(bmp.width, bmp.height);
+      if (big <= 2000 && f.size <= 1.5 * 1024 * 1024 && ext !== 'gif') { bmp.close && bmp.close(); return { name: f.name, data: await toBase64(f) }; }
+      const k = Math.min(1, 2000 / big);
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(bmp.width * k)); cv.height = Math.max(1, Math.round(bmp.height * k));
+      const cx = cv.getContext('2d');
+      cx.fillStyle = '#fff'; cx.fillRect(0, 0, cv.width, cv.height); // transparent PNGs would turn black as JPEG
+      cx.drawImage(bmp, 0, 0, cv.width, cv.height);
+      bmp.close && bmp.close();
+      return { name: f.name.replace(/\.[^.]+$/, '') + '.jpg', data: cv.toDataURL('image/jpeg', 0.88).split(',')[1] };
+    } catch (_) { return { name: f.name, data: await toBase64(f) }; }
+  }
+  // Removes empty pieces the AI sometimes returns, so the notes never show blank gaps.
+  function cleanSummary(sm) {
+    const t = (v) => (typeof v === 'string' ? v.trim() : '');
+    const meaningful = (v) => /[\p{L}\p{N}]/u.test(t(v));
+    sm.title = t(sm.title); sm.overview = t(sm.overview);
+    sm.sections = (Array.isArray(sm.sections) ? sm.sections : []).map((x) => {
+      const dg = x && x.diagram && meaningful(x.diagram.mermaid) ? { title: t(x.diagram.title), mermaid: String(x.diagram.mermaid).trim() } : null;
+      return { heading: t(x && x.heading), points: (Array.isArray(x && x.points) ? x.points : []).map(t).filter(meaningful), diagram: dg };
+    }).filter((x) => x.points.length || x.diagram);
+    sm.technical = (Array.isArray(sm.technical) ? sm.technical : []).map(t).filter(meaningful);
+    sm.keyTerms = (Array.isArray(sm.keyTerms) ? sm.keyTerms : []).map((k) => ({ term: t(k && k.term), definition: t(k && k.definition) })).filter((k) => meaningful(k.term) && meaningful(k.definition));
+    return sm;
   }
   async function post(url, body) {
     const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -97,8 +128,9 @@
     setLoading(btn, true);
     try {
       const payload = [];
-      for (const f of files) payload.push({ name: f.name, data: await toBase64(f) });
-      summary = await post('/api/summarize', { files: payload, text });
+      for (const f of files) payload.push(await prepareFile(f));
+      summary = cleanSummary(await post('/api/summarize', { files: payload, text }));
+      if (!summary.sections.length && !summary.overview) throw new Error('The AI returned an empty summary. Please try again.');
       renderSummary(text);
       $('quizRun').classList.add('hidden'); $('quizResult').classList.add('hidden'); $('quizSetup').classList.remove('hidden');
       $('summarySection').classList.remove('hidden');
@@ -123,11 +155,12 @@
     $('sumOverview').textContent = summary.overview || '';
     const outWords = words(summaryText());
     $('sumStat').textContent = outWords + ' words' + (words(inputText) > 50 ? ' (from ' + words(inputText) + ')' : '');
-    $('sumBody').innerHTML = (summary.sections || []).map((s) => `
+    $('sumOverview').hidden = !summary.overview;
+    $('sumBody').innerHTML = (summary.sections || []).map((s, i) => `
       <div class="sum-section">
-        <h3>${esc(s.heading)}</h3>
-        <ul>${(s.points || []).map((p) => `<li>${fmt(p)}</li>`).join('')}</ul>
-        ${s.diagram && s.diagram.mermaid ? `<div class="diagram"><div class="d-title">${esc(s.diagram.title || 'Diagram')}</div><div class="mermaid-box" data-src="${esc(s.diagram.mermaid)}"></div></div>` : ''}
+        ${s.heading ? `<h3>${esc(s.heading)}</h3>` : ''}
+        ${s.points.length ? `<ul>${s.points.map((p) => `<li>${fmt(p)}</li>`).join('')}</ul>` : ''}
+        ${s.diagram ? `<div class="diagram"><div class="d-title">${esc(s.diagram.title || 'Diagram')}</div><div class="mermaid-box" data-si="${i}" data-src="${esc(s.diagram.mermaid)}"></div></div>` : ''}
       </div>`).join('');
     const tech = summary.technical || [];
     $('sumTechnical').innerHTML = tech.length
@@ -150,7 +183,12 @@
         el.innerHTML = svg;
       } catch (e) {
         document.querySelectorAll('[id^="dmmd-"]').forEach((x) => x.remove());
-        el.innerHTML = '<pre>' + esc(src) + '</pre>';
+        // A diagram that cannot be drawn is removed instead of leaving an empty box or raw code.
+        const si = +el.dataset.si;
+        if (summary && summary.sections[si]) summary.sections[si].diagram = null;
+        const card = el.closest('.diagram'), sec = el.closest('.sum-section');
+        if (card) card.remove();
+        if (sec && !sec.querySelector('li, .diagram')) sec.remove();
       }
     }
   }
