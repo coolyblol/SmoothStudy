@@ -3,7 +3,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { kindOf, extractText } = require('./extract');
+const { kindOf, imageTypeOf, extractAll } = require('./extract');
 const demo = require('./demo');
 
 // Minimal .env loader
@@ -22,6 +22,8 @@ const OLD_NAME = !KEY && !!process.env.ANTHROPIC_API_KEY; // an old .env that st
 const MODEL = process.env.AI_MODEL || 'openai/gpt-oss-120b';
 const API_URL = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
 const EFFORT = process.env.REASONING_EFFORT || 'low'; // low | medium | high
+const VISION_MODEL = process.env.VISION_MODEL || 'qwen/qwen3.8-27b'; // reads pictures; the main model is text-only
+const VISION_MAX = Math.max(0, parseInt(process.env.VISION_MAX || '6', 10) || 0); // most pictures read per summary
 const PORT = process.env.PORT || 3000;
 const MAX_BODY = 360 * 1024 * 1024; // 5 files x 50 MB, base64-encoded
 
@@ -57,6 +59,8 @@ Rules:
 - "diagram" is optional per section; include it (as a flowchart, sequence, mindmap or timeline) only where it genuinely helps understanding, at most 4 diagrams in total. Otherwise use null.
 - Mermaid rules: valid Mermaid syntax only. Start with e.g. "flowchart TD". Wrap every node label in double quotes, e.g. A["Label text"]. Avoid parentheses, quotes, colons and special characters inside labels. Keep diagrams small (under 12 nodes).
 - "technical" and "keyTerms" may be empty arrays.
+- Never output empty strings, empty points or placeholder text. Leave out anything you have nothing real to say about.
+- Material may include "[Picture: ...]" blocks, which are text read from images or descriptions of figures. Treat them as part of the notes.
 - Write in clear student-friendly language in the same language as the source material.`;
 
 const QUIZ_SYSTEM = `You are SmoothStudy's quiz generator. Using ONLY the study summary provided, write multiple choice questions that test understanding.
@@ -132,9 +136,48 @@ async function callAI(system, userText, maxTokens) {
 
 const TEXT_CAP_PER_FILE = 200000; // characters; the model reads about 131k tokens in total
 const TEXT_CAP_TOTAL = 300000;
+const IMG_MAX_BYTES = 3.6 * 1024 * 1024; // Groq accepts about 4 MB of base64 per picture
+
+const VISION_PROMPT = 'You are reading one picture from a student\'s study material. Write down ALL the text in it exactly (headings, labels, equations, table cells, handwriting), keeping the reading order. If it is a diagram, chart, graph, table or figure, then describe what it shows and how its parts relate, including the numbers and axis labels. If it has no useful study content (a logo, a decoration, a photo of a person), reply with exactly: NONE. Plain text only, no preamble.';
+
+// Reads one picture with the vision model. Returns text, '' for nothing useful, or throws.
+async function describeImage(mime, buf) {
+  const body = {
+    model: VISION_MODEL,
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: VISION_PROMPT },
+      { type: 'image_url', image_url: { url: `data:${mime};base64,${buf.toString('base64')}` } },
+    ] }],
+    temperature: 0.1,
+    max_completion_tokens: 2500,
+  };
+  const r = await fetch(API_URL, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + KEY }, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((data.error && data.error.message) || `picture reading failed (${r.status})`);
+  const t = String((((data.choices || [])[0] || {}).message || {}).content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  return /^none\.?$/i.test(t) ? '' : t;
+}
+
+// Reads pictures a few at a time. Returns [{label, text}] in the original order and a list of problems.
+async function readPictures(list) {
+  const out = new Array(list.length), problems = [];
+  let next = 0;
+  async function worker() {
+    while (next < list.length) {
+      const i = next++;
+      const im = list[i];
+      try { out[i] = { label: im.label, text: await describeImage(im.mime, im.data) }; }
+      catch (e) { out[i] = { label: im.label, text: '' }; problems.push(e.message); }
+    }
+  }
+  await Promise.all([worker(), worker(), worker()].slice(0, Math.min(3, list.length)));
+  return { items: out.filter(Boolean), problems };
+}
 
 async function handleSummarize(body) {
   const parts = [];
+  const pictures = []; // {label, mime, data, from}
+  const notes = [];
   let textTotal = 0, fileCount = 0;
   for (const f of body.files || []) {
     if (!f || typeof f.data !== 'string') continue;
@@ -142,25 +185,58 @@ async function handleSummarize(body) {
     const kind = kindOf(name);
     if (!kind) throw new Error(`${name}: this file type isn't supported.`);
     if (kind === 'legacy') throw new Error(`${name}: old .doc, .ppt and .xls files can't be read. Open it and save as .docx, .pptx or .xlsx, then upload again.`);
-    if (kind === 'image') throw new Error(`${name}: the AI model reads text only, so pictures can't be read. Type or paste the text instead, or upload a PDF, Word or PowerPoint file.`);
     fileCount++;
     const buf = Buffer.from(f.data, 'base64');
-    let text;
-    try { text = extractText(kind, buf).trim(); }
+    if (kind === 'image') {
+      const mime = imageTypeOf(name) || 'image/png';
+      if (buf.length > IMG_MAX_BYTES) throw new Error(`${name}: the picture is too large to read (${(buf.length / 1048576).toFixed(1)} MB). Try a smaller or lower-resolution copy.`);
+      pictures.push({ label: name, mime, data: buf, from: name, standalone: true });
+      continue;
+    }
+    let res;
+    try { res = await extractAll(kind, buf); }
     catch (e) { throw new Error(`${name}: ${e.message}`); }
-    if (!text) throw new Error(`${name}: no readable text found (a deck made only of pictures, for example). Paste the text instead.`);
-    text = text.slice(0, Math.min(TEXT_CAP_PER_FILE, Math.max(0, TEXT_CAP_TOTAL - textTotal)));
-    textTotal += text.length;
-    if (text) parts.push(`Content of "${name}":\n\n${text}`);
+    let text = (res.text || '').trim();
+    const imgs = (res.images || []).filter((im) => im.data.length <= IMG_MAX_BYTES);
+    if (!text && !imgs.length) throw new Error(`${name}: nothing readable was found in this file. Paste the text instead.`);
+    if (text) {
+      text = text.slice(0, Math.min(TEXT_CAP_PER_FILE, Math.max(0, TEXT_CAP_TOTAL - textTotal)));
+      textTotal += text.length;
+      if (text) parts.push(`Content of "${name}":\n\n${text}`);
+    }
+    for (const im of imgs) pictures.push({ ...im, from: name });
+    if (!text && imgs.length) notes.push(`${name} has no selectable text, so its pictures are being read instead.`);
   }
   const typed = (body.text || '').toString().slice(0, 100000);
   if (typed.trim()) parts.push(`Student's typed notes:\n\n${typed}`);
-  if (!parts.length) throw new Error('Nothing to summarise. Add notes or upload a file.');
+  if (!parts.length && !pictures.length) throw new Error('Nothing to summarise. Add notes or upload a file.');
   if (DEMO) {
     await sleep(900); // so the loading spinner is visible
     return demo.summary({ files: fileCount, chars: textTotal + typed.length });
   }
-  return extractJSON(await callAI(SUMMARY_SYSTEM, parts.join('\n\n') + '\n\nCreate the study summary JSON now.', 8000));
+  if (pictures.length) {
+    // Standalone pictures and scanned pages come first; figures inside documents fill what is left.
+    const ranked = [...pictures.filter((p) => p.standalone || p.scan), ...pictures.filter((p) => !p.standalone && !p.scan)].slice(0, VISION_MAX);
+    const skipped = pictures.length - ranked.length;
+    if (!VISION_MAX && pictures.some((p) => p.standalone) && !parts.length) throw new Error('Picture reading is switched off (VISION_MAX=0). Type the text instead.');
+    if (ranked.length && KEY && !OLD_NAME) {
+      const { items, problems } = await readPictures(ranked);
+      let any = false;
+      for (const it of items) {
+        if (!it.text) continue;
+        any = true;
+        const p = `[Picture: ${it.label}]\n${it.text}`;
+        parts.push(p);
+      }
+      if (!any && !parts.length) {
+        throw new Error(problems.length ? `The picture couldn't be read: ${problems[0]}` : 'No readable study content was found in the picture(s). Try a clearer, closer photo.');
+      }
+      if (skipped > 0) notes.push(`${skipped} more picture(s) were not read to keep the summary fast.`);
+    }
+  }
+  if (!parts.length) throw new Error('Nothing readable was found. Add notes or upload a clearer file.');
+  const prompt = parts.join('\n\n') + '\n\nCreate the study summary JSON now.';
+  return extractJSON(await callAI(SUMMARY_SYSTEM, prompt, 8000));
 }
 
 async function handleQuiz(body) {
