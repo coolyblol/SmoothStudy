@@ -19,8 +19,8 @@
   --ok: #2f8f5b;
   --bad: #c0392b;
   --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --gs: 'Google Sans', 'Lexend', system-ui, sans-serif;
-  --candy: 'Emilys Candy', 'Lexend', cursive;
+  --gs: 'Google Sans', 'Outfit', system-ui, sans-serif;
+  --candy: 'Emilys Candy', 'Outfit', cursive;
 }
 
 :root[data-theme="dark"] {
@@ -55,7 +55,7 @@ html {
 
 body {
   margin: 0;
-  font-family: 'Lexend', system-ui, sans-serif;
+  font-family: 'Outfit', system-ui, sans-serif;
   font-weight: 400;
   line-height: 1.65;
   color: var(--text);
@@ -87,17 +87,17 @@ pre {
   z-index: -1;
   pointer-events: none;
   background:
+    radial-gradient(circle, rgba(160, 80, 55, .20) 1.2px, transparent 1.6px) 0 0 / 26px 26px,
     radial-gradient(72rem 38rem at 88% -8%, rgba(240, 150, 108, .36), transparent 64%),
-    radial-gradient(54rem 36rem at -8% 22%, rgba(200, 85, 61, .16), transparent 64%),
-    radial-gradient(64rem 36rem at 50% 112%, rgba(240, 162, 124, .19), transparent 62%);
+    radial-gradient(54rem 36rem at -8% 22%, rgba(200, 85, 61, .16), transparent 64%);
   transition: opacity .4s ease;
 }
 
 :root[data-theme="dark"] .bg-glow {
   background:
+    radial-gradient(circle, rgba(143, 184, 222, .20) 1.2px, transparent 1.6px) 0 0 / 26px 26px,
     radial-gradient(72rem 38rem at 88% -8%, rgba(143, 184, 222, .30), transparent 64%),
-    radial-gradient(54rem 36rem at -8% 22%, rgba(241, 230, 207, .12), transparent 64%),
-    radial-gradient(64rem 36rem at 50% 112%, rgba(143, 184, 222, .17), transparent 62%);
+    radial-gradient(54rem 36rem at -8% 22%, rgba(241, 230, 207, .12), transparent 64%);
 }
 
 /* ---------- Theme switch ---------- */
@@ -194,6 +194,7 @@ pre {
 }
 
 .brand {
+  font-family: 'Lexend', system-ui, sans-serif; /* stays Lexend */
   position: fixed;
   top: 18px;
   left: 18px;
@@ -434,7 +435,7 @@ main {
   padding: 12px 24px;
   border-radius: 999px;
   border: 1px solid transparent;
-  font: 500 .95rem 'Lexend', sans-serif;
+  font: 500 .95rem 'Outfit', sans-serif;
   text-decoration: none;
   cursor: pointer;
   transition: transform .25s cubic-bezier(.2, .8, .2, 1), box-shadow .25s ease, background-position .5s ease, border-color .25s, color .25s, background .25s;
@@ -608,7 +609,7 @@ textarea {
   border: 1px solid var(--border);
   background: var(--bg-soft);
   color: var(--text);
-  font: 400 .95rem 'Lexend', sans-serif;
+  font: 400 .95rem 'Outfit', sans-serif;
   transition: border-color .25s, box-shadow .25s;
 }
 
@@ -815,7 +816,7 @@ code {
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text);
-  font: 500 .92rem 'Lexend', sans-serif;
+  font: 500 .92rem 'Outfit', sans-serif;
   cursor: pointer;
   transition: transform .25s cubic-bezier(.2, .8, .2, 1), background .25s, border-color .25s, color .25s, box-shadow .25s;
 }
@@ -887,7 +888,7 @@ code {
   border: 1px solid var(--border);
   background: var(--bg-soft);
   color: var(--text);
-  font: 400 .96rem 'Lexend', sans-serif;
+  font: 400 .96rem 'Outfit', sans-serif;
   cursor: pointer;
   transition: transform .25s cubic-bezier(.2, .8, .2, 1), border-color .25s, background .25s, box-shadow .25s;
 }
@@ -992,9 +993,15 @@ code {
 }
 
 .foot {
+  position: relative;
+  z-index: 1;
+  margin-top: 56px;
   text-align: center;
-  padding: 20px 18px 40px;
+  padding: 30px 18px 44px;
   color: var(--muted);
+  background: var(--bg); /* plain colour: hides the dots behind it */
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -18px 30px -12px var(--bg);
 }
 
 .foot-note {
@@ -1042,7 +1049,6 @@ code {
 
 .scroll-btn svg {
   flex: none;
-  transition: transform .3s cubic-bezier(.2, .8, .2, 1);
 }
 
 .sb-label {
@@ -1083,16 +1089,6 @@ code {
 .scroll-btn:focus-visible .sb-label {
   max-width: 90px;
   opacity: 1;
-}
-
-#scrollUp:hover svg,
-#scrollUp:focus-visible svg {
-  transform: translateY(-2px);
-}
-
-#scrollDown:hover svg,
-#scrollDown:focus-visible svg {
-  transform: translateY(2px);
 }
 
 .scroll-btn:focus-visible {
