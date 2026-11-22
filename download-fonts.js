@@ -2,7 +2,7 @@
 // Usage:  node download-fonts.js        (needs Node 18+ and an internet connection, once)
 //
 // It saves the files into ./fonts and writes ./fonts.css, which the page already links to.
-// Fonts: Lexend, JetBrains Mono, Pinyon Script, Emilys Candy, Google Sans (all open-licence Google Fonts).
+// Fonts: Outfit (main text), Lexend (theme, scroll and brand buttons), JetBrains Mono, Pinyon Script, Emilys Candy, Google Sans (all open-licence Google Fonts).
 // It also saves GoogleSans-Regular.ttf and GoogleSans-Bold.ttf, which the PDF export embeds.
 const fs = require('fs');
 const path = require('path');
@@ -13,7 +13,8 @@ const TTF_UA = 'curl/8.5.0'; // an unknown browser gets plain TrueType files, wh
 const OUT = path.join(__dirname, 'fonts');
 
 const FAMILIES = [
-  { name: 'Lexend', weights: '300;400;500;600;700' },
+  { name: 'Outfit', weights: '300;400;500;600;700' },
+  { name: 'Lexend', weights: '400;500;600' },
   { name: 'JetBrains Mono', weights: '400;500' },
   { name: 'Pinyon Script', weights: null },
   { name: 'Emilys Candy', weights: null },
